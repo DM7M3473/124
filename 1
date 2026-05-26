@@ -1,0 +1,493 @@
+import { useState, useEffect } from "react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer, Cell } from "recharts";
+
+const STORAGE_KEY = "calorie_log";
+const CAL_GOAL = 2000;
+const PRO_GOAL = 120;
+
+function getTodayKey() {
+  return new Date().toISOString().split("T")[0];
+}
+function getYesterdayKey() {
+  const d = new Date(); d.setDate(d.getDate() - 1);
+  return d.toISOString().split("T")[0];
+}
+function formatDate(dateStr) {
+  const [y, m, d] = dateStr.split("-");
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+}
+function formatShort(dateStr) {
+  const [y, m, d] = dateStr.split("-");
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+function getMonthLabel(dateStr) {
+  const [y, m] = dateStr.split("-");
+  return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+}
+function getWeekNumber(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  const startOfYear = new Date(y, 0, 1);
+  return Math.ceil(((date - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
+}
+function getWeekRange(dateStrs) {
+  const dates = dateStrs.map(d => new Date(...d.split("-").map((v, i) => i === 1 ? v - 1 : +v)));
+  const min = new Date(Math.min(...dates));
+  const max = new Date(Math.max(...dates));
+  const fmt = d => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return `${fmt(min)} – ${fmt(max)}`;
+}
+function groupByMonth(log) {
+  const grouped = {};
+  Object.entries(log).sort(([a], [b]) => b.localeCompare(a)).forEach(([date, val]) => {
+    const mk = date.slice(0, 7);
+    if (!grouped[mk]) grouped[mk] = [];
+    grouped[mk].push({ date, ...val });
+  });
+  return grouped;
+}
+function groupByWeek(days) {
+  const weeks = {};
+  days.forEach(({ date, ...rest }) => {
+    const [y] = date.split("-");
+    const wk = getWeekNumber(date);
+    const key = `${y}-W${String(wk).padStart(2, "0")}`;
+    if (!weeks[key]) weeks[key] = [];
+    weeks[key].push({ date, ...rest });
+  });
+  return Object.entries(weeks).sort(([a], [b]) => b.localeCompare(a));
+}
+
+export default function CalorieTracker() {
+  const [log, setLog] = useState({});
+  const [calInput, setCalInput] = useState("");
+  const [proInput, setProInput] = useState("");
+  const [flashCal, setFlashCal] = useState(false);
+  const [flashPro, setFlashPro] = useState(false);
+  const [activeMonth, setActiveMonth] = useState(null);
+  const [tab, setTab] = useState("today");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await window.storage.get(STORAGE_KEY);
+        if (result?.value) setLog(JSON.parse(result.value));
+      } catch {}
+    })();
+  }, []);
+
+  async function save(newLog) {
+    try { await window.storage.set(STORAGE_KEY, JSON.stringify(newLog)); } catch {}
+    setLog(newLog);
+  }
+
+  const todayKey = getTodayKey();
+  const yesterdayKey = getYesterdayKey();
+  const todayCals = log[todayKey]?.cals || 0;
+  const todayPro = log[todayKey]?.pro || 0;
+
+  // Rollover: if yesterday was under goal, carry the surplus forward (max 500 rollover)
+  const yesterdayCals = log[yesterdayKey]?.cals || 0;
+  const rollover = yesterdayCals > 0 ? Math.min(Math.max(CAL_GOAL - yesterdayCals, 0), 500) : 0;
+  const effectiveBudget = CAL_GOAL + rollover;
+
+  const calOver = todayCals > effectiveBudget;
+  const calPct = Math.min((todayCals / effectiveBudget) * 100, 100);
+  const proPct = Math.min((todayPro / PRO_GOAL) * 100, 100);
+  const proMet = todayPro >= PRO_GOAL;
+
+  // Streak protection: warn at 80% of budget, only if not yet over
+  const atEightyPct = !calOver && calPct >= 80;
+  const remainingCals = effectiveBudget - todayCals;
+
+  function addCals() {
+    const val = parseInt(calInput.replace(/[^0-9]/g, ""), 10);
+    if (!val || val <= 0) return;
+    const entry = log[todayKey] || { cals: 0, pro: 0 };
+    save({ ...log, [todayKey]: { ...entry, cals: entry.cals + val } });
+    setCalInput("");
+    setFlashCal(true); setTimeout(() => setFlashCal(false), 600);
+  }
+  function addPro() {
+    const val = parseInt(proInput.replace(/[^0-9]/g, ""), 10);
+    if (!val || val <= 0) return;
+    const entry = log[todayKey] || { cals: 0, pro: 0 };
+    save({ ...log, [todayKey]: { ...entry, pro: entry.pro + val } });
+    setProInput("");
+    setFlashPro(true); setTimeout(() => setFlashPro(false), 600);
+  }
+  function resetToday() {
+    const newLog = { ...log }; delete newLog[todayKey]; save(newLog);
+  }
+  function handleEditDay(date, field, newVal) {
+    const val = parseInt(newVal, 10);
+    if (isNaN(val) || val < 0) return;
+    const entry = log[date] || { cals: 0, pro: 0 };
+    const updated = { ...entry, [field]: val };
+    const newLog = { ...log };
+    if (updated.cals === 0 && updated.pro === 0) delete newLog[date];
+    else newLog[date] = updated;
+    save(newLog);
+  }
+
+  const grouped = groupByMonth(log);
+  const months = Object.keys(grouped);
+
+  const sortedDays = Object.entries(log).sort(([a], [b]) => b.localeCompare(a));
+  let streak = 0;
+  for (const [date, v] of sortedDays) {
+    const dayRollover = 0; // streak just checks vs base goal
+    if ((v.cals || 0) <= CAL_GOAL) streak++; else break;
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#0e0e0e", color: "#f0ece3",
+      fontFamily: "'Georgia', serif", display: "flex", flexDirection: "column",
+      alignItems: "center", padding: "0 16px 60px",
+    }}>
+      {/* Header */}
+      <div style={{ width: "100%", maxWidth: 480, paddingTop: 48, marginBottom: 32, textAlign: "center" }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.25em", color: "#888", textTransform: "uppercase", marginBottom: 8 }}>
+          Calorie & Protein Tracker
+        </div>
+        <h1 style={{ margin: 0, fontSize: 36, fontWeight: "normal", letterSpacing: "-0.5px" }}>Daily Log</h1>
+        {streak >= 2 && (
+          <div style={{ marginTop: 10, fontSize: 12, color: "#c8f5a0", letterSpacing: "0.05em" }}>
+            🔥 {streak}-day deficit streak — keep it up
+          </div>
+        )}
+      </div>
+
+      {/* Tabs */}
+      <div style={{
+        width: "100%", maxWidth: 480, display: "flex",
+        background: "#181818", border: "1px solid #2a2a2a",
+        borderRadius: 14, padding: 4, marginBottom: 28, gap: 4,
+      }}>
+        {["today", "history"].map(t => (
+          <button key={t} onClick={() => setTab(t)} style={{
+            flex: 1, background: tab === t ? "#2e2e2e" : "transparent",
+            border: "none", borderRadius: 10,
+            color: tab === t ? "#f0ece3" : "#555",
+            padding: "10px 0", fontSize: 13, fontFamily: "inherit",
+            letterSpacing: "0.12em", textTransform: "uppercase", cursor: "pointer", transition: "all 0.2s",
+          }}>
+            {t === "today" ? "Today" : "History"}
+          </button>
+        ))}
+      </div>
+
+      {/* TODAY */}
+      {tab === "today" && (
+        <div style={{ width: "100%", maxWidth: 480, display: "flex", flexDirection: "column", gap: 14 }}>
+
+          {/* Streak protection warning */}
+          {atEightyPct && (
+            <div style={{
+              background: "#1e1a0e", border: "1px solid #4a3f10",
+              borderRadius: 14, padding: "14px 18px",
+              display: "flex", alignItems: "center", gap: 12,
+            }}>
+              <span style={{ fontSize: 20 }}>⚠️</span>
+              <div>
+                <div style={{ fontSize: 13, color: "#f5d87a", letterSpacing: "0.02em" }}>
+                  Streak protection — {remainingCals.toLocaleString()} kcal left
+                </div>
+                <div style={{ fontSize: 11, color: "#7a6830", marginTop: 2 }}>
+                  You're at {Math.round(calPct)}% of your {effectiveBudget.toLocaleString()} kcal budget today
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Rollover banner */}
+          {rollover > 0 && (
+            <div style={{
+              background: "#0e1a14", border: "1px solid #1a3a28",
+              borderRadius: 14, padding: "12px 18px",
+              display: "flex", alignItems: "center", gap: 12,
+            }}>
+              <span style={{ fontSize: 18 }}>↩️</span>
+              <div>
+                <div style={{ fontSize: 13, color: "#7ae0b0" }}>
+                  +{rollover} kcal rolled over from yesterday
+                </div>
+                <div style={{ fontSize: 11, color: "#2a6a4a", marginTop: 2 }}>
+                  Today's budget: {effectiveBudget.toLocaleString()} kcal
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Calories card */}
+          <div style={{
+            background: "#181818", border: `1px solid ${calOver ? "#3a2020" : atEightyPct ? "#3a3010" : "#2a2a2a"}`,
+            borderRadius: 20, padding: "28px 28px 24px", transition: "border-color 0.4s",
+          }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#666", textTransform: "uppercase", marginBottom: 4 }}>
+              Calories · {formatDate(todayKey)}
+            </div>
+            <div style={{
+              fontSize: 64, fontWeight: "normal", lineHeight: 1,
+              color: flashCal ? "#c8f5a0" : calOver ? "#f7a4a4" : atEightyPct ? "#f5d87a" : "#f0ece3",
+              transition: "color 0.3s",
+            }}>
+              {todayCals.toLocaleString()}
+              <span style={{ fontSize: 18, color: "#555", marginLeft: 8 }}>kcal</span>
+            </div>
+            <div style={{ marginTop: 16, marginBottom: 6, background: "#252525", borderRadius: 99, height: 6, overflow: "hidden" }}>
+              <div style={{
+                height: "100%", width: `${calPct}%`,
+                background: calOver ? "#f7a4a4" : atEightyPct ? "#f5d87a" : "#c8f5a0",
+                borderRadius: 99, transition: "width 0.4s, background 0.3s",
+              }} />
+            </div>
+            <div style={{ fontSize: 12, color: "#555", marginBottom: 20 }}>
+              {calOver
+                ? `Over budget · goal was ${effectiveBudget.toLocaleString()} kcal`
+                : `${remainingCals.toLocaleString()} kcal remaining of ${effectiveBudget.toLocaleString()}`}
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <input type="number" value={calInput} onChange={e => setCalInput(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && addCals()}
+                placeholder="Add calories…"
+                style={{
+                  flex: 1, background: "#111", border: "1px solid #333", borderRadius: 12,
+                  padding: "13px 16px", fontSize: 17, color: "#f0ece3", outline: "none", fontFamily: "inherit",
+                }} />
+              <button onClick={addCals} style={{
+                background: "#c8f5a0", color: "#0e0e0e", border: "none", borderRadius: 12,
+                padding: "13px 22px", fontSize: 15, fontWeight: "bold", cursor: "pointer", fontFamily: "inherit",
+              }}>+ Add</button>
+            </div>
+          </div>
+
+          {/* Protein card */}
+          <div style={{
+            background: "#181818", border: `1px solid ${proMet ? "#1a2e3a" : "#2a2a2a"}`,
+            borderRadius: 20, padding: "28px 28px 24px", transition: "border-color 0.4s",
+          }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#666", textTransform: "uppercase", marginBottom: 4 }}>
+              Protein
+            </div>
+            <div style={{
+              fontSize: 64, fontWeight: "normal", lineHeight: 1,
+              color: flashPro ? "#a0d4f5" : proMet ? "#a0d4f5" : "#f0ece3",
+              transition: "color 0.3s",
+            }}>
+              {todayPro}
+              <span style={{ fontSize: 18, color: "#555", marginLeft: 8 }}>g</span>
+            </div>
+            <div style={{ marginTop: 16, marginBottom: 6, background: "#252525", borderRadius: 99, height: 6, overflow: "hidden" }}>
+              <div style={{
+                height: "100%", width: `${proPct}%`,
+                background: proMet ? "#a0d4f5" : "#6a8fb0",
+                borderRadius: 99, transition: "width 0.4s",
+              }} />
+            </div>
+            <div style={{ fontSize: 12, color: "#555", marginBottom: 20 }}>
+              {proMet ? `Goal met · ${PRO_GOAL}g target ✓` : `${PRO_GOAL - todayPro}g remaining of ${PRO_GOAL}g goal`}
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <input type="number" value={proInput} onChange={e => setProInput(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && addPro()}
+                placeholder="Add protein (g)…"
+                style={{
+                  flex: 1, background: "#111", border: "1px solid #333", borderRadius: 12,
+                  padding: "13px 16px", fontSize: 17, color: "#f0ece3", outline: "none", fontFamily: "inherit",
+                }} />
+              <button onClick={addPro} style={{
+                background: "#a0d4f5", color: "#0e0e0e", border: "none", borderRadius: 12,
+                padding: "13px 22px", fontSize: 15, fontWeight: "bold", cursor: "pointer", fontFamily: "inherit",
+              }}>+ Add</button>
+            </div>
+          </div>
+
+          {(todayCals > 0 || todayPro > 0) && (
+            <button onClick={resetToday} style={{
+              background: "transparent", border: "none", color: "#444", fontSize: 12,
+              cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.1em",
+              textTransform: "uppercase", textDecoration: "underline", textDecorationColor: "#2a2a2a",
+              alignSelf: "flex-start", padding: 0,
+            }}>Reset today</button>
+          )}
+        </div>
+      )}
+
+      {/* HISTORY */}
+      {tab === "history" && (
+        <div style={{ width: "100%", maxWidth: 480 }}>
+          {months.length === 0 ? (
+            <div style={{ color: "#444", fontSize: 14, textAlign: "center", marginTop: 40 }}>
+              Your history will appear here once you start logging.
+            </div>
+          ) : months.map(monthKey => {
+            const days = grouped[monthKey];
+            const totalCals = days.reduce((s, d) => s + (d.cals || 0), 0);
+            const totalPro = days.reduce((s, d) => s + (d.pro || 0), 0);
+            const avgCals = Math.round(totalCals / days.length);
+            const avgPro = Math.round(totalPro / days.length);
+            const daysUnder = days.filter(d => (d.cals || 0) <= CAL_GOAL).length;
+            const isOpen = activeMonth === monthKey;
+            const weeks = groupByWeek(days);
+
+            // Chart data — sorted ascending for left-to-right display
+            const chartData = [...days]
+              .sort(([a], [b]) => a.date < b.date ? -1 : 1)
+              .map(d => ({ label: formatShort(d.date), cals: d.cals || 0 }));
+
+            return (
+              <div key={monthKey} style={{
+                background: "#181818", border: "1px solid #2a2a2a",
+                borderRadius: 16, marginBottom: 12, overflow: "hidden",
+              }}>
+                {/* Month header */}
+                <button onClick={() => setActiveMonth(isOpen ? null : monthKey)} style={{
+                  width: "100%", background: "none", border: "none", color: "#f0ece3",
+                  cursor: "pointer", display: "flex", justifyContent: "space-between",
+                  alignItems: "center", padding: "18px 22px", fontFamily: "inherit", textAlign: "left",
+                }}>
+                  <div>
+                    <div style={{ fontSize: 16 }}>{getMonthLabel(monthKey + "-01")}</div>
+                    <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>
+                      avg {avgCals.toLocaleString()} kcal · avg {avgPro}g protein · {daysUnder}/{days.length} under goal
+                    </div>
+                  </div>
+                  <div style={{ color: "#555", fontSize: 20, transition: "transform 0.2s", transform: isOpen ? "rotate(180deg)" : "rotate(0deg)" }}>↓</div>
+                </button>
+
+                {isOpen && (
+                  <div style={{ borderTop: "1px solid #222" }}>
+
+                    {/* Calorie trend chart */}
+                    <div style={{ padding: "20px 16px 8px" }}>
+                      <div style={{ fontSize: 11, color: "#555", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+                        Calorie Trend
+                      </div>
+                      <ResponsiveContainer width="100%" height={140}>
+                        <BarChart data={chartData} barCategoryGap="20%">
+                          <XAxis
+                            dataKey="label"
+                            tick={{ fill: "#444", fontSize: 10 }}
+                            axisLine={false}
+                            tickLine={false}
+                            interval={Math.floor(chartData.length / 6)}
+                          />
+                          <YAxis hide domain={[0, Math.max(...chartData.map(d => d.cals), CAL_GOAL) * 1.15]} />
+                          <Tooltip
+                            cursor={{ fill: "#ffffff08" }}
+                            contentStyle={{ background: "#1e1e1e", border: "1px solid #333", borderRadius: 8, fontFamily: "Georgia, serif", fontSize: 12 }}
+                            labelStyle={{ color: "#888" }}
+                            itemStyle={{ color: "#f0ece3" }}
+                            formatter={v => [`${v.toLocaleString()} kcal`, ""]}
+                          />
+                          <ReferenceLine y={CAL_GOAL} stroke="#444" strokeDasharray="4 3" />
+                          <Bar dataKey="cals" radius={[4, 4, 0, 0]}>
+                            {chartData.map((entry, i) => (
+                              <Cell key={i} fill={entry.cals > CAL_GOAL ? "#f7a4a4" : "#c8f5a0"} fillOpacity={0.85} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                      <div style={{ fontSize: 10, color: "#333", textAlign: "right", marginTop: 2 }}>
+                        — dashed line = {CAL_GOAL.toLocaleString()} kcal goal
+                      </div>
+                    </div>
+
+                    {/* Weekly breakdown */}
+                    <div style={{ borderTop: "1px solid #1e1e1e", marginTop: 8 }}>
+                      {weeks.map(([weekKey, weekDays]) => {
+                        const wCals = weekDays.reduce((s, d) => s + (d.cals || 0), 0);
+                        const wPro = weekDays.reduce((s, d) => s + (d.pro || 0), 0);
+                        const wAvgCals = Math.round(wCals / weekDays.length);
+                        const wAvgPro = Math.round(wPro / weekDays.length);
+                        const range = getWeekRange(weekDays.map(d => d.date));
+                        return (
+                          <div key={weekKey}>
+                            <div style={{
+                              display: "flex", justifyContent: "space-between", alignItems: "center",
+                              padding: "10px 22px 6px", background: "#141414", borderBottom: "1px solid #1e1e1e",
+                            }}>
+                              <div style={{ fontSize: 11, color: "#555", letterSpacing: "0.12em", textTransform: "uppercase" }}>{range}</div>
+                              <div style={{ fontSize: 11, color: "#555" }}>~{wAvgCals.toLocaleString()} kcal · ~{wAvgPro}g protein</div>
+                            </div>
+                            {weekDays.map(({ date, cals, pro }) => (
+                              <DayRow key={date} date={date} cals={cals || 0} pro={pro || 0}
+                                isToday={date === todayKey}
+                                onEditCals={val => handleEditDay(date, "cals", val)}
+                                onEditPro={val => handleEditDay(date, "pro", val)} />
+                            ))}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DayRow({ date, cals, pro, isToday, onEditCals, onEditPro }) {
+  const [editField, setEditField] = useState(null);
+  const [val, setVal] = useState("");
+  const calOver = cals > CAL_GOAL;
+  const proMet = pro >= PRO_GOAL;
+
+  function commit() {
+    if (editField === "cals") onEditCals(val);
+    else onEditPro(val);
+    setEditField(null);
+  }
+
+  return (
+    <div style={{
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+      padding: "12px 22px", borderBottom: "1px solid #1e1e1e",
+      background: isToday ? "#1c2018" : "transparent",
+    }}>
+      <div>
+        <span style={{ fontSize: 14, color: isToday ? "#c8f5a0" : "#bbb" }}>{formatDate(date)}</span>
+        {isToday && <span style={{ fontSize: 10, color: "#6a8a50", marginLeft: 8, letterSpacing: "0.1em", textTransform: "uppercase" }}>today</span>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        {editField === "cals" ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input autoFocus type="number" value={val} onChange={e => setVal(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditField(null); }}
+              style={{ width: 80, background: "#111", border: "1px solid #444", borderRadius: 8, padding: "4px 8px", color: "#f0ece3", fontSize: 13, fontFamily: "inherit", outline: "none", textAlign: "right" }} />
+            <button onClick={commit} style={{ background: "none", border: "none", color: "#c8f5a0", cursor: "pointer", fontSize: 13 }}>✓</button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+            onClick={() => { setVal(String(cals)); setEditField("cals"); }}>
+            <span style={{ fontSize: 14, color: calOver ? "#f7a4a4" : "#f0ece3" }}>{cals.toLocaleString()}</span>
+            <span style={{ fontSize: 11, color: "#555" }}>kcal</span>
+            <span style={{ fontSize: 11, color: calOver ? "#7a3535" : "#6a8a50" }}>{calOver ? "↑" : "✓"}</span>
+          </div>
+        )}
+        <span style={{ color: "#333", fontSize: 12 }}>·</span>
+        {editField === "pro" ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input autoFocus type="number" value={val} onChange={e => setVal(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditField(null); }}
+              style={{ width: 70, background: "#111", border: "1px solid #444", borderRadius: 8, padding: "4px 8px", color: "#f0ece3", fontSize: 13, fontFamily: "inherit", outline: "none", textAlign: "right" }} />
+            <button onClick={commit} style={{ background: "none", border: "none", color: "#a0d4f5", cursor: "pointer", fontSize: 13 }}>✓</button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+            onClick={() => { setVal(String(pro)); setEditField("pro"); }}>
+            <span style={{ fontSize: 14, color: proMet ? "#a0d4f5" : "#f0ece3" }}>{pro}</span>
+            <span style={{ fontSize: 11, color: "#555" }}>g</span>
+            <span style={{ fontSize: 11, color: proMet ? "#4a7a9a" : "#555" }}>{proMet ? "✓" : ""}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
